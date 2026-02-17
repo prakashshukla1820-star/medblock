@@ -27,6 +27,7 @@ router.get('/hospital-status', async (req: Request, res: Response) => {
 
 // POST /reserve-dose
 // Accepts a patientId. Checks if stock > 0. Decrements stock. Inserts a reservation.
+// Uses row-level locking (SELECT FOR UPDATE) to prevent over-reservation under concurrency.
 router.post('/reserve-dose', async (req: Request, res: Response) => {
     const { patientId } = req.body;
     let client;
@@ -34,11 +35,21 @@ router.post('/reserve-dose', async (req: Request, res: Response) => {
     try {
         client = await getDbClient();
 
-        // 1. Check stock
-        const stockRes = await client.query('SELECT count FROM inventory WHERE item_name = $1', ['Pfizer-Batch-A']);
+        await client.query('BEGIN');
+
+        // 1. Lock the inventory row and read stock (blocks other transactions until we commit/rollback)
+        const stockRes = await client.query(
+            'SELECT count FROM inventory WHERE item_name = $1 FOR UPDATE',
+            ['Pfizer-Batch-A']
+        );
+        if (stockRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Inventory not found' });
+        }
         const currentStock = stockRes.rows[0].count;
 
         if (currentStock <= 0) {
+            await client.query('ROLLBACK');
             return res.status(400).json({ error: 'No doses available' });
         }
 
@@ -48,9 +59,11 @@ router.post('/reserve-dose', async (req: Request, res: Response) => {
         // 3. Create reservation
         await client.query('INSERT INTO reservations (patient_id, status, timestamp) VALUES ($1, $2, NOW())', [patientId, 'CONFIRMED']);
 
+        await client.query('COMMIT');
         res.json({ success: true, message: 'Dose reserved' });
     } catch (err) {
         console.error(err);
+        if (client) await client.query('ROLLBACK').catch(() => {});
         res.status(500).json({ error: 'Internal Server Error' });
     } finally {
         if (client) await client.end();
@@ -60,16 +73,20 @@ router.post('/reserve-dose', async (req: Request, res: Response) => {
 // --- VITALS INGESTION ---
 
 // POST /ingest-vitals
-// Accepts raw vitals. Performs heavy encryption. Returns success.
-router.post('/ingest-vitals', (req: Request, res: Response) => {
+// Accepts raw vitals. Performs heavy encryption (async, non-blocking). Returns success or error.
+router.post('/ingest-vitals', async (req: Request, res: Response) => {
     const { vitals } = req.body;
 
-    // Simulate heavy encryption (CPU bound)
-    simulateHeavyEncryption();
+    // Simulate heavy encryption (async, does not block the event loop)
+    const result = await simulateHeavyEncryption();
+
+    if (result) {
+        res.json({ success: true, message: 'Vitals processed' });
+    } else {
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
 
     // In a real app, we would save the encrypted vitals to DB here
-
-    res.json({ success: true, message: 'Vitals processed' });
 });
 
 export default router;
